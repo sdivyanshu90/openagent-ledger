@@ -1,0 +1,23 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+body:
+  - type: textarea
+    id: description
+    attributes:
+      {
+        label: Description,
+        description: What happened and what did you expect?,
+      }
+    validations: { required: true }
+  - type: textarea
+    id: reproduction
+    attributes:
+      {
+        label: Reproduction,
+        description: Include minimal steps and relevant logs with secrets removed.,
+      }
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Version and environment }
+    validations: { required: true }

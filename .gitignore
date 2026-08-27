@@ -1,0 +1,28 @@
+node_modules/
+dist/
+.data/
+playwright-report/
+test-results/
+coverage/
+.env
+*.log
+
+# Local tooling and caches
+.local/
+.cache/
+.eslintcache
+.vite/
+*.tsbuildinfo
+*.tmp
+*.swp
+*~
+
+# Editor and operating-system metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Playwright-generated artifacts
+blob-report/
+playwright/.cache/

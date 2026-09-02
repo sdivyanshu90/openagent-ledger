@@ -13,6 +13,7 @@ export const ledgerStateSchema = z.enum([
   "FAILED",
   "VERIFIED",
   "ROLLED_BACK",
+  "ROLLBACK_FAILED",
 ]);
 
 export const jsonSchemaSchema = z.object({
@@ -63,6 +64,7 @@ export const transitionSchema = z.object({
   detail: z.string().optional(),
   previousHash: z.string(),
   integrityHash: z.string(),
+  evidenceHash: z.string().optional(),
 });
 
 export const ledgerEntrySchema = z.object({
@@ -90,12 +92,15 @@ export const ledgerEntrySchema = z.object({
   state: ledgerStateSchema,
   transitions: z.array(transitionSchema),
   approvalTokenHash: z.string().optional(),
+  approvalExpiresAt: z.string().datetime().optional(),
+  approvalRevision: z.number().int().positive().optional(),
   approvedBy: z.string().optional(),
   executionResult: z.unknown().optional(),
   error: z.string().optional(),
   rollback: z
     .object({ before: issueSchema, rolledBackAt: z.string().datetime() })
     .optional(),
+  rollbackError: z.string().optional(),
   correlationId: z.string().uuid(),
   traceId: z.string().uuid(),
   previousHash: z.string(),
@@ -137,7 +142,12 @@ export const runSchema = z.object({
     "failed",
     "rejected",
   ]),
-  adapter: z.literal("deterministic-local"),
+  adapter: z.enum([
+    "deterministic-local",
+    "deterministic-contract",
+    "native-webmcp",
+    "workbench-simulation",
+  ]),
   selectedTools: z.array(z.string()),
   ledgerEntryIds: z.array(z.string().uuid()),
   findings: z.array(findingSchema),
@@ -146,6 +156,28 @@ export const runSchema = z.object({
     .enum(["webmcp", "workbench", "deterministic-local"])
     .default("deterministic-local"),
   goal: z.string().optional(),
+  discoveredContracts: z
+    .array(
+      z.object({
+        name: z.string(),
+        description: z.string(),
+        schemaFingerprint: z.string(),
+      }),
+    )
+    .default([]),
+  actionOutcome: z
+    .enum([
+      "AWAITING_CONFIRMATION",
+      "REJECTED",
+      "VERIFIED",
+      "FAILED",
+      "ROLLED_BACK",
+    ])
+    .default("AWAITING_CONFIRMATION"),
+  evaluationVerdict: z
+    .enum(["NOT_EVALUATED", "PASSED", "FAILED"])
+    .default("NOT_EVALUATED"),
+  evaluationReason: z.string().default("Evaluation is not complete."),
 });
 
 export const databaseSchema = z.object({

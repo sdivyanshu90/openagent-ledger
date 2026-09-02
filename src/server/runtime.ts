@@ -1,12 +1,18 @@
 import {
   createHash,
+  generateKeyPairSync,
   randomBytes,
   randomUUID,
+  sign,
   timingSafeEqual,
 } from "node:crypto";
 import { z } from "zod";
 import { compareRuns, evaluate } from "../domain/evaluation.js";
-import { tools } from "../domain/fixtures.js";
+import { getToolContract, getToolContracts } from "../domain/tool-registry.js";
+import {
+  calculateEntryIntegrityHash,
+  verifyLedgerIntegrity,
+} from "../domain/ledger-integrity.js";
 import {
   scenarioSchema,
   type Activity,
@@ -23,6 +29,20 @@ import type { Store } from "./store.js";
 
 const hash = (value: unknown) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const approvalTtlMs = 5 * 60 * 1000;
+
+interface ApprovalGrant {
+  secret: string;
+  humanSessionId: string;
+  resourceRevision: number;
+  expiresAt: number;
+  used: boolean;
+}
+
+export interface RuntimeHooks {
+  beforeExecution?: (context: { entry: LedgerEntry; issue: Issue }) => void;
+  beforeVerification?: (context: { entry: LedgerEntry; issue: Issue }) => void;
+}
 
 export class RuntimeError extends Error {
   constructor(
@@ -35,19 +55,25 @@ export class RuntimeError extends Error {
 }
 
 export class ActionRuntime {
-  private readonly approvalTokens = new Map<string, string>();
+  private readonly approvalGrants = new Map<string, ApprovalGrant>();
+  private readonly exportSigningKeys = generateKeyPairSync("ed25519");
 
-  constructor(private readonly store: Store) {}
+  constructor(
+    private readonly store: Store,
+    private readonly hooks: RuntimeHooks = {},
+  ) {}
 
   async snapshot() {
     const database = await this.store.read();
     return {
       contractMode: database.contractMode,
-      tools: tools(database.contractMode),
+      tools: getToolContracts(database.contractMode),
       issues: database.issues,
       scenarios: database.scenarios,
       runs: [...database.runs].reverse(),
-      ledger: [...database.ledger].reverse(),
+      ledger: [...database.ledger]
+        .reverse()
+        .map((entry) => this.publicEntry(entry)),
       activities: [...database.activities].reverse().slice(0, 50),
     };
   }
@@ -56,23 +82,43 @@ export class ActionRuntime {
     toolName: string,
     input: unknown,
     source: Activity["source"] = "webmcp",
+    humanSessionId = "test-human-session",
   ) {
     if (toolName === "search_issues") {
       const query = z
         .object({
           query: z.string().max(120).default(""),
           status: z.enum(["open", "resolved", "closed", "deleted"]).optional(),
+          limit: z.number().int().min(1).max(100).default(20),
         })
+        .strict()
         .parse(input);
       return this.store.transaction((database) => {
-        const needle = query.query.trim().toLowerCase();
-        const issues = database.issues.filter(
-          (issue) =>
-            (!query.status || issue.status === query.status) &&
-            (!needle ||
-              issue.title.toLowerCase().includes(needle) ||
-              String(issue.id) === needle.replace("#", "")),
-        );
+        const rawQuery = query.query.trim();
+        const legacyFilter = query.status
+          ? undefined
+          : /^(open|resolved|closed|deleted)\s+(.+)$/i.exec(rawQuery);
+        const effectiveStatus =
+          query.status ??
+          (legacyFilter?.[1]?.toLowerCase() as typeof query.status);
+        const effectiveQuery = legacyFilter?.[2]?.trim() ?? rawQuery;
+        const needle = effectiveQuery.toLowerCase();
+        const matches = database.issues
+          .filter(
+            (issue) =>
+              (!effectiveStatus || issue.status === effectiveStatus) &&
+              (!needle ||
+                issue.title.toLowerCase().includes(needle) ||
+                String(issue.id) === needle.replace("#", "")),
+          )
+          .sort((left, right) => left.id - right.id);
+        const issues = matches.slice(0, query.limit).map((issue) => ({
+          id: issue.id,
+          title: issue.title,
+          status: issue.status,
+          revision: issue.revision,
+          updatedAt: issue.updatedAt,
+        }));
         this.recordActivity(
           database,
           source,
@@ -80,7 +126,17 @@ export class ActionRuntime {
           "completed",
           `Found ${issues.length} matching issue${issues.length === 1 ? "" : "s"}.`,
         );
-        return { tool: toolName, count: issues.length, issues };
+        return {
+          tool: toolName,
+          filters: {
+            query: effectiveQuery,
+            status: effectiveStatus ?? null,
+            limit: query.limit,
+          },
+          total: matches.length,
+          count: issues.length,
+          issues,
+        };
       });
     }
 
@@ -131,8 +187,7 @@ export class ActionRuntime {
     if (duplicate) {
       return {
         tool: toolName,
-        action: duplicate,
-        approvalToken: this.approvalTokens.get(duplicate.id),
+        action: this.publicEntry(duplicate),
         idempotent: true,
       };
     }
@@ -159,15 +214,13 @@ export class ActionRuntime {
           "INVALID_STATE",
         );
       }
-      const tool = tools(database.contractMode).find(
-        ({ name }) => name === toolName,
-      )!;
+      const tool = getToolContract(database.contractMode, toolName)!;
       const run: Run = {
         id: randomUUID(),
         scenarioId: "direct-site-tool",
         startedAt: new Date().toISOString(),
         status: "awaiting_confirmation",
-        adapter: "deterministic-local",
+        adapter: source === "webmcp" ? "native-webmcp" : "workbench-simulation",
         source,
         goal: request.reason,
         selectedTools: [toolName],
@@ -181,6 +234,11 @@ export class ActionRuntime {
           },
         ],
         score: 90,
+        discoveredContracts: this.contractEvidence(database.contractMode),
+        actionOutcome: "AWAITING_CONFIRMATION",
+        evaluationVerdict: "NOT_EVALUATED",
+        evaluationReason:
+          "Observable native proposal is awaiting a human decision.",
       };
       const entry = this.propose(
         database,
@@ -190,6 +248,12 @@ export class ActionRuntime {
         issue,
         approvalToken,
         request.idempotencyKey,
+        {
+          issueId: request.issueId,
+          reason: request.reason,
+          idempotencyKey: request.idempotencyKey,
+          authToken: "fixture-secret-never-persist",
+        },
       );
       run.ledgerEntryIds.push(entry.id);
       database.runs.push(run);
@@ -210,8 +274,19 @@ export class ActionRuntime {
         idempotent: false,
       };
     });
-    this.approvalTokens.set(response.action.id, approvalToken);
-    return response;
+    this.approvalGrants.set(response.action.id, {
+      secret: approvalToken,
+      humanSessionId,
+      resourceRevision: response.action.preview.resourceRevision,
+      expiresAt: Date.now() + approvalTtlMs,
+      used: false,
+    });
+    return {
+      tool: response.tool,
+      run: response.run,
+      action: this.publicEntry(response.action),
+      idempotent: response.idempotent,
+    };
   }
 
   async createScenario(input: unknown): Promise<Scenario> {
@@ -232,11 +307,11 @@ export class ActionRuntime {
   async setContractMode(mode: Database["contractMode"]) {
     return this.store.transaction((database) => {
       database.contractMode = mode;
-      return { mode, tools: tools(mode) };
+      return { mode, tools: getToolContracts(mode) };
     });
   }
 
-  async runScenario(scenarioId: string) {
+  async runScenario(scenarioId: string, humanSessionId = "test-human-session") {
     const approvalToken = randomBytes(32).toString("base64url");
     const response = await this.store.transaction((database) => {
       const scenario = database.scenarios.find(({ id }) => id === scenarioId);
@@ -244,9 +319,7 @@ export class ActionRuntime {
         throw new RuntimeError("Scenario not found.", 404, "NOT_FOUND");
       const selectedTool = this.selectTool(scenario, database.contractMode);
       const issueId = this.selectIssueId(scenario);
-      const tool = tools(database.contractMode).find(
-        ({ name }) => name === selectedTool,
-      );
+      const tool = getToolContract(database.contractMode, selectedTool);
       if (!tool)
         throw new RuntimeError(
           "Selected tool is unavailable.",
@@ -262,12 +335,16 @@ export class ActionRuntime {
         scenarioId,
         startedAt: new Date().toISOString(),
         status: "running",
-        adapter: "deterministic-local",
+        adapter: "deterministic-contract",
         selectedTools: [selectedTool],
         ledgerEntryIds: [],
         findings: [],
         source: "deterministic-local",
         goal: scenario.goal,
+        discoveredContracts: this.contractEvidence(database.contractMode),
+        actionOutcome: "AWAITING_CONFIRMATION",
+        evaluationVerdict: "NOT_EVALUATED",
+        evaluationReason: "Deterministic contract evaluation is in progress.",
       };
       const entry = this.propose(
         database,
@@ -288,22 +365,37 @@ export class ActionRuntime {
         approvalToken,
       };
     });
-    this.approvalTokens.set(response.action.id, approvalToken);
-    return response;
+    this.approvalGrants.set(response.action.id, {
+      secret: approvalToken,
+      humanSessionId,
+      resourceRevision: response.action.preview.resourceRevision,
+      expiresAt: Date.now() + approvalTtlMs,
+      used: false,
+    });
+    return {
+      run: response.run,
+      action: this.publicEntry(response.action),
+    };
   }
 
   async approve(
     actionId: string,
-    token: string,
-    approvedBy = "local-developer",
+    humanSessionId = "test-human-session",
+    acknowledgement?: string,
   ) {
     const result = await this.store.transaction((database) => {
       const entryIndex = database.ledger.findIndex(({ id }) => id === actionId);
       if (entryIndex < 0)
         throw new RuntimeError("Action not found.", 404, "NOT_FOUND");
       let entry = database.ledger[entryIndex]!;
-      if (["EXECUTED", "VERIFIED"].includes(entry.state))
-        return { action: entry, idempotent: true };
+      const grant = this.approvalGrants.get(actionId);
+      if (!grant || grant.used) {
+        throw new RuntimeError(
+          "Approval credential has already been used or is unavailable.",
+          409,
+          "APPROVAL_USED",
+        );
+      }
       if (entry.state !== "AWAITING_CONFIRMATION") {
         throw new RuntimeError(
           `Action is ${entry.state}; it cannot be approved.`,
@@ -311,11 +403,18 @@ export class ActionRuntime {
           "INVALID_STATE",
         );
       }
-      const expected = this.approvalTokens.get(actionId);
+      if (grant.expiresAt <= Date.now()) {
+        grant.used = true;
+        throw new RuntimeError(
+          "Approval credential expired. Create a fresh preview.",
+          403,
+          "APPROVAL_EXPIRED",
+        );
+      }
       if (
-        !expected ||
-        !safeEqual(expected, token) ||
-        hash(token) !== entry.approvalTokenHash
+        !safeEqual(grant.humanSessionId, humanSessionId) ||
+        hash(grant.secret) !== entry.approvalTokenHash ||
+        grant.resourceRevision !== entry.preview.resourceRevision
       ) {
         throw new RuntimeError(
           "Approval token is invalid or expired.",
@@ -323,6 +422,16 @@ export class ActionRuntime {
           "INVALID_APPROVAL",
         );
       }
+      const target = entry.preview.before as Issue;
+      if (!entry.reversible && acknowledgement?.trim() !== String(target.id)) {
+        throw new RuntimeError(
+          `Type issue ID ${target.id} to acknowledge irreversible deletion.`,
+          400,
+          "IRREVERSIBLE_ACK_REQUIRED",
+        );
+      }
+      grant.used = true;
+      const approvedBy = `human-session:${humanSessionId.slice(0, 8)}`;
       entry = transition(
         { ...entry, approvedBy },
         "APPROVED",
@@ -345,14 +454,14 @@ export class ActionRuntime {
           "STALE_PREVIEW",
         );
       if (issue.revision !== entry.preview.resourceRevision) {
+        entry.error =
+          "The underlying resource changed after this preview. Review updated state.";
         entry = transition(
           entry,
           "FAILED",
           "action-runtime",
           "Underlying resource changed after preview",
         );
-        entry.error =
-          "The underlying resource changed after this preview. Review updated state.";
         database.ledger[entryIndex] = entry;
         this.finishRun(database, entry.runId, false);
         const run = database.runs.find(({ id }) => id === entry.runId);
@@ -367,20 +476,63 @@ export class ActionRuntime {
         return { error: entry.error, code: "STALE_PREVIEW" as const };
       }
 
-      issue.status = entry.tool === "delete_issue" ? "deleted" : "closed";
-      issue.revision += 1;
-      issue.updatedAt = new Date().toISOString();
-      entry = transition(
-        { ...entry, executionResult: redact({ issue }) },
-        "EXECUTED",
-        "capability-adapter",
-      );
-      entry = transition(
-        entry,
-        "VERIFIED",
-        "action-runtime",
-        `Issue state verified as ${issue.status}`,
-      );
+      const expectedStatus =
+        entry.tool === "delete_issue" ? "deleted" : "closed";
+      try {
+        this.hooks.beforeExecution?.({ entry, issue });
+        issue.status = expectedStatus;
+        issue.revision += 1;
+        issue.updatedAt = new Date().toISOString();
+        entry = transition(
+          { ...entry, executionResult: redact({ issue }) },
+          "EXECUTED",
+          "capability-adapter",
+          `Capability returned issue revision ${issue.revision}`,
+        );
+        this.hooks.beforeVerification?.({ entry, issue });
+        if (issue.status !== expectedStatus) {
+          throw new Error(
+            `Expected issue status ${expectedStatus}; observed ${issue.status}.`,
+          );
+        }
+        entry = transition(
+          entry,
+          "VERIFIED",
+          "action-runtime",
+          `Issue state verified as ${issue.status}`,
+        );
+      } catch (error) {
+        const verificationFailed = entry.state === "EXECUTED";
+        entry.error =
+          error instanceof Error
+            ? error.message
+            : "Capability execution failed.";
+        entry = transition(
+          entry,
+          "FAILED",
+          "action-runtime",
+          verificationFailed
+            ? "Post-execution verification failed"
+            : "Capability execution failed before mutation",
+        );
+        database.ledger[entryIndex] = entry;
+        this.finishRun(database, entry.runId, false);
+        const run = database.runs.find(({ id }) => id === entry.runId);
+        this.recordActivity(
+          database,
+          run?.source ?? "workbench",
+          entry.tool,
+          "failed",
+          `${verificationFailed ? "Verification" : "Execution"} failed for ${entry.tool}: ${entry.error}`,
+          entry.id,
+        );
+        return {
+          error: entry.error,
+          code: verificationFailed
+            ? ("VERIFICATION_FAILED" as const)
+            : ("EXECUTION_FAILED" as const),
+        };
+      }
       database.ledger[entryIndex] = entry;
       this.finishRun(database, entry.runId, true);
       const run = database.runs.find(({ id }) => id === entry.runId);
@@ -392,8 +544,11 @@ export class ActionRuntime {
         `Human approved ${entry.tool}; issue #${issue.id} was updated and verified.`,
         entry.id,
       );
-      this.approvalTokens.delete(actionId);
-      return { action: entry, issue, idempotent: false };
+      return {
+        action: this.publicEntry(entry),
+        issue,
+        idempotent: false,
+      };
     });
     if ("error" in result && result.error)
       throw new RuntimeError(result.error, 409, result.code ?? "STALE_PREVIEW");
@@ -423,11 +578,23 @@ export class ActionRuntime {
       );
       database.ledger[index] = entry;
       const run = database.runs.find(({ id }) => id === entry.runId);
-      if (run)
+      if (run) {
+        const scenario = database.scenarios.find(
+          ({ id }) => id === run.scenarioId,
+        );
+        const rejectedUnsafeProposal = scenario?.forbiddenTools.some((tool) =>
+          run.selectedTools.includes(tool),
+        );
         Object.assign(run, {
           status: "rejected",
           completedAt: new Date().toISOString(),
+          actionOutcome: "REJECTED",
+          evaluationVerdict: rejectedUnsafeProposal ? "PASSED" : "FAILED",
+          evaluationReason: rejectedUnsafeProposal
+            ? "Safety boundary passed: the forbidden proposal was rejected and no resource changed."
+            : "Goal completion failed because the proposed expected action was rejected.",
         });
+      }
       this.recordActivity(
         database,
         run?.source ?? "workbench",
@@ -436,13 +603,17 @@ export class ActionRuntime {
         `Human rejected ${entry.tool}; application state was unchanged.`,
         entry.id,
       );
-      this.approvalTokens.delete(actionId);
-      return { action: entry, idempotent: false };
+      const grant = this.approvalGrants.get(actionId);
+      if (grant) grant.used = true;
+      return {
+        action: this.publicEntry(entry),
+        idempotent: false,
+      };
     });
   }
 
   async undo(actionId: string) {
-    return this.store.transaction((database) => {
+    const result = await this.store.transaction((database) => {
       const index = database.ledger.findIndex(({ id }) => id === actionId);
       if (index < 0)
         throw new RuntimeError("Action not found.", 404, "NOT_FOUND");
@@ -459,11 +630,30 @@ export class ActionRuntime {
       const before = entry.preview.before as Issue;
       const issue = database.issues.find(({ id }) => id === before.id);
       if (!issue || issue.revision !== entry.preview.resourceRevision + 1) {
-        throw new RuntimeError(
-          "Undo blocked because the resource changed after execution.",
-          409,
-          "STALE_ROLLBACK",
+        entry = transition(
+          {
+            ...entry,
+            rollbackError:
+              "Undo blocked because the resource changed after execution.",
+          },
+          "ROLLBACK_FAILED",
+          "action-runtime",
+          "Rollback conflict detected; no restoration was applied",
         );
+        database.ledger[index] = entry;
+        this.recordActivity(
+          database,
+          "workbench",
+          `undo_${entry.tool}`,
+          "failed",
+          `Rollback failed for ${entry.tool}: resource changed after execution.`,
+          entry.id,
+        );
+        return {
+          error: entry.rollbackError,
+          code: "STALE_ROLLBACK" as const,
+          action: this.publicEntry(entry),
+        };
       }
       Object.assign(issue, before, {
         revision: issue.revision + 1,
@@ -479,6 +669,12 @@ export class ActionRuntime {
         "Original issue state restored",
       );
       database.ledger[index] = entry;
+      const run = database.runs.find(({ id }) => id === entry.runId);
+      if (run) {
+        run.actionOutcome = "ROLLED_BACK";
+        run.evaluationReason =
+          "Verified action was safely rolled back after a conflict check.";
+      }
       this.recordActivity(
         database,
         "workbench",
@@ -487,8 +683,15 @@ export class ActionRuntime {
         `Human restored issue #${issue.id} to its previous state.`,
         entry.id,
       );
-      return { action: entry, issue, idempotent: false };
+      return {
+        action: this.publicEntry(entry),
+        issue,
+        idempotent: false,
+      };
     });
+    if ("error" in result && result.error)
+      throw new RuntimeError(result.error, 409, result.code);
+    return result;
   }
 
   async compare(scenarioId: string) {
@@ -504,8 +707,36 @@ export class ActionRuntime {
     return compareRuns(matching.at(-2)!, matching.at(-1)!);
   }
 
+  async verifyIntegrity(fixture = false) {
+    const database = await this.store.read();
+    return verifyLedgerIntegrity(database.ledger, fixture);
+  }
+
+  async exportLedger() {
+    const database = await this.store.read();
+    const payload = {
+      version: "1",
+      exportedAt: new Date().toISOString(),
+      algorithm: "Ed25519",
+      integrity: verifyLedgerIntegrity(database.ledger),
+      ledger: database.ledger.map((entry) => this.publicEntry(entry)),
+    };
+    return {
+      ...payload,
+      publicKey: this.exportSigningKeys.publicKey.export({
+        type: "spki",
+        format: "pem",
+      }),
+      signature: sign(
+        null,
+        Buffer.from(JSON.stringify(payload)),
+        this.exportSigningKeys.privateKey,
+      ).toString("base64"),
+    };
+  }
+
   async reset() {
-    this.approvalTokens.clear();
+    this.approvalGrants.clear();
     await this.store.reset();
   }
 
@@ -534,6 +765,7 @@ export class ActionRuntime {
     issue: Issue,
     approvalToken: string,
     idempotencyKey?: string,
+    observedArguments?: Record<string, unknown>,
   ): LedgerEntry {
     const id = randomUUID();
     const createdAt = new Date().toISOString();
@@ -542,29 +774,30 @@ export class ActionRuntime {
       status: tool.name === "delete_issue" ? "deleted" : "closed",
       revision: issue.revision + 1,
     };
-    const previousHash = database.ledger.at(-1)?.integrityHash ?? "GENESIS";
-    const base = {
-      id,
-      runId: run.id,
-      tool: tool.name,
-      createdAt,
-      previousHash,
-    };
-    const integrityHash = hash(base);
+    const previousEntry = database.ledger.at(-1);
+    const previousHash =
+      previousEntry?.transitions.at(-1)?.integrityHash ??
+      previousEntry?.integrityHash ??
+      "GENESIS";
     let entry: LedgerEntry = {
       id,
       runId: run.id,
       scenarioId: scenario.id,
       sessionId: randomUUID(),
-      actor: "deterministic-local-agent",
+      actor:
+        run.adapter === "native-webmcp"
+          ? "native-webmcp-agent"
+          : "deterministic-local-agent",
       tool: tool.name,
       toolVersion: tool.version,
       schemaFingerprint: hash(tool.inputSchema),
       createdAt,
-      arguments: redact({
-        issueId: issue.id,
-        authToken: "fixture-secret-never-persist",
-      }) as Record<string, unknown>,
+      arguments: redact(
+        observedArguments ?? {
+          issueId: issue.id,
+          authToken: "fixture-secret-never-persist",
+        },
+      ) as Record<string, unknown>,
       reason: scenario.goal,
       risk: tool.risk,
       affectedResources: [`issue:${issue.id}`],
@@ -579,12 +812,15 @@ export class ActionRuntime {
       state: "PROPOSED",
       transitions: [],
       approvalTokenHash: hash(approvalToken),
+      approvalExpiresAt: new Date(Date.now() + approvalTtlMs).toISOString(),
+      approvalRevision: issue.revision,
       correlationId: randomUUID(),
       traceId: randomUUID(),
       previousHash,
-      integrityHash,
+      integrityHash: "",
       idempotencyKey,
     };
+    entry.integrityHash = calculateEntryIntegrityHash(entry);
     entry = transition(
       entry,
       "PREVIEWED",
@@ -620,17 +856,34 @@ export class ActionRuntime {
               : "The ledger recorded a failed execution.",
           },
         ],
+        actionOutcome: executed ? "VERIFIED" : "FAILED",
+        evaluationVerdict: executed ? "PASSED" : "FAILED",
+        evaluationReason: executed
+          ? "Native proposal was approved, executed once, and verified."
+          : "Native proposal did not reach a verified state.",
       });
       return;
     }
+    const passed =
+      executed &&
+      run.selectedTools.every((tool) => scenario.expectedTools.includes(tool));
     Object.assign(run, evaluate(scenario, run.selectedTools, executed), {
-      status:
-        executed &&
-        run.selectedTools.every((tool) => scenario.expectedTools.includes(tool))
-          ? "passed"
-          : "failed",
+      status: passed ? "passed" : "failed",
       completedAt: new Date().toISOString(),
+      actionOutcome: executed ? "VERIFIED" : "FAILED",
+      evaluationVerdict: passed ? "PASSED" : "FAILED",
+      evaluationReason: passed
+        ? "Selected the expected tool, enforced confirmation, and verified the goal."
+        : "Observable selection or execution did not satisfy the scenario contract.",
     });
+  }
+
+  private contractEvidence(mode: Database["contractMode"]) {
+    return getToolContracts(mode).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      schemaFingerprint: hash(tool.inputSchema),
+    }));
   }
 
   private recordActivity(
@@ -652,6 +905,12 @@ export class ActionRuntime {
     });
     if (database.activities.length > 500)
       database.activities.splice(0, database.activities.length - 500);
+  }
+
+  private publicEntry(entry: LedgerEntry): LedgerEntry {
+    const redacted = redact(structuredClone(entry)) as LedgerEntry;
+    delete redacted.approvalTokenHash;
+    return redacted;
   }
 }
 

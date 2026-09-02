@@ -21,7 +21,7 @@ declare global {
 }
 
 export interface WebMcpBridgeCallbacks {
-  onAction?: (proposal: { action: LedgerEntry; token: string }) => void;
+  onAction?: (proposal: { action: LedgerEntry }) => void;
   onActivity?: () => void;
   onStatus?: (status: {
     supported: boolean;
@@ -39,6 +39,7 @@ const siteToolNames = new Set([
 ]);
 
 export function registerWebMcpTools(
+  availableDefinitions: ToolDefinition[],
   callbacks: WebMcpBridgeCallbacks = {},
 ): () => void {
   const context = document.modelContext;
@@ -48,10 +49,9 @@ export function registerWebMcpTools(
   }
 
   const controller = new AbortController();
-  void api
-    .snapshot()
-    .then(async (snapshot) => {
-      const definitions = snapshot.tools.filter(({ name }) =>
+  void Promise.resolve()
+    .then(async () => {
+      const definitions = availableDefinitions.filter(({ name }) =>
         siteToolNames.has(name),
       );
       for (const definition of definitions) {
@@ -100,12 +100,7 @@ function toWebMcpTool(
         input,
       );
       callbacks.onActivity?.();
-      if (proposal.approvalToken) {
-        callbacks.onAction?.({
-          action: proposal.action,
-          token: proposal.approvalToken,
-        });
-      }
+      callbacks.onAction?.({ action: proposal.action });
       return publicProposal(proposal);
     },
   };

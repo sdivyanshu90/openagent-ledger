@@ -20,8 +20,21 @@ export interface Snapshot {
 export interface CapabilityProposal {
   tool: "close_issue" | "delete_issue";
   action: LedgerEntry;
-  approvalToken?: string;
   idempotent: boolean;
+}
+
+export interface IntegrityReport {
+  valid: boolean;
+  checkedEntries: number;
+  checkedTransitions: number;
+  fixture?: boolean;
+  broken?: {
+    entryId: string;
+    transitionIndex?: number;
+    reason: string;
+    expected: string;
+    actual: string;
+  };
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -38,14 +51,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   snapshot: () => request<Snapshot>("/api/snapshot"),
   run: (scenarioId: string) =>
-    request<{ run: Run; action: LedgerEntry; approvalToken: string }>(
+    request<{ run: Run; action: LedgerEntry }>(
       `/api/scenarios/${scenarioId}/runs`,
       { method: "POST", body: "{}" },
     ),
-  approve: (id: string, approvalToken: string) =>
+  approve: (id: string, acknowledgement?: string) =>
     request(`/api/actions/${id}/approve`, {
       method: "POST",
-      body: JSON.stringify({ approvalToken }),
+      body: JSON.stringify({ acknowledgement }),
     }),
   reject: (id: string) =>
     request(`/api/actions/${id}/reject`, { method: "POST", body: "{}" }),
@@ -64,14 +77,22 @@ export const api = {
       delta: number;
       result: string;
     }>(`/api/scenarios/${scenarioId}/compare`),
+  integrity: (fixture = false) =>
+    request<IntegrityReport>(
+      `/api/ledger/integrity${fixture ? "?fixture=broken" : ""}`,
+    ),
   createScenario: (scenario: Scenario) =>
     request<Scenario>("/api/scenarios", {
       method: "POST",
       body: JSON.stringify(scenario),
     }),
-  invoke: <T = unknown>(tool: string, input: Record<string, unknown>) =>
+  invoke: <T = unknown>(
+    tool: string,
+    input: Record<string, unknown>,
+    source: "webmcp" | "workbench" = "webmcp",
+  ) =>
     request<T>(`/api/capabilities/${tool}/invoke`, {
       method: "POST",
-      body: JSON.stringify({ source: "webmcp", input }),
+      body: JSON.stringify({ source, input }),
     }),
 };

@@ -29,6 +29,11 @@ In a WebMCP-capable browser, open the page and ask ChatGPT to search for login i
 - evidence-based evaluation and baseline/current comparison
 - native WebMCP registration with read-only annotations and a live activity feed
 - idempotent mutation proposals that never expose approval credentials to the agent
+- canonical live contract refresh after safety improvements
+- server-held, expiring, session- and revision-scoped approval grants
+- readable ledger forensics, hash-chain verification, safe failure fixture, and signed export
+- distinct action outcomes, safety verdicts, and native/deterministic run labels
+- guided five-minute judge walkthrough and explicit simulation fallback
 
 ## Architecture
 
@@ -50,7 +55,7 @@ npm run build              # production server and client
 npm start                  # serve the production build on :3000
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for extension guidance, [docs/demo.md](docs/demo.md) for the reproducible demonstration, and [docs/submission.md](docs/submission.md) for the challenge brief and video plan. Security reports follow [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for extension guidance and [docs/demo.md](docs/demo.md) for the reproducible demonstration. Security reports follow [SECURITY.md](SECURITY.md).
 
 ## WebMCP status and roadmap
 

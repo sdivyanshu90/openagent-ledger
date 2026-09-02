@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 interface CapturedSiteTool {
   name: string;
+  description: string;
   annotations?: { readOnlyHint?: boolean };
   execute(input: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
@@ -20,8 +21,14 @@ test.beforeEach(async ({ request, page }) => {
     Object.defineProperty(document, "modelContext", {
       configurable: true,
       value: {
-        registerTool(tool: CapturedSiteTool) {
+        registerTool(
+          tool: CapturedSiteTool,
+          options?: { signal?: AbortSignal },
+        ) {
           captured.set(tool.name, tool);
+          options?.signal?.addEventListener("abort", () => {
+            if (captured.get(tool.name) === tool) captured.delete(tool.name);
+          });
         },
       },
     });
@@ -29,10 +36,37 @@ test.beforeEach(async ({ request, page }) => {
   await page.goto("/");
 });
 
+test("synchronizes improved contracts with native discovery", async ({
+  page,
+}) => {
+  await expect(page.getByText("4 native tools live")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => window.__siteTools.get("delete_issue")?.description,
+    ),
+  ).toContain("Remove an issue");
+
+  await page.getByRole("button", { name: /delete_issue/ }).click();
+  await page.getByRole("button", { name: "Apply improved contract" }).click();
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__siteTools.get("delete_issue")?.description ?? "",
+      ),
+    )
+    .toContain("Permanently and irreversibly deletes");
+  const discoveredDescription = await page.evaluate(
+    () => window.__siteTools.get("delete_issue")!.description,
+  );
+  expect(discoveredDescription).toContain("permanent deletion is explicit");
+  expect(discoveredDescription).toContain("prefer close_issue");
+});
+
 test("registers real capabilities and exposes verifiable read results", async ({
   page,
 }) => {
-  await expect(page.getByText("4 site tools live")).toBeVisible();
+  await expect(page.getByText("4 native tools live")).toBeVisible();
   const registration = await page.evaluate(() =>
     [...window.__siteTools].map(([name, tool]) => ({
       name,
@@ -46,12 +80,27 @@ test("registers real capabilities and exposes verifiable read results", async ({
     { name: "delete_issue", readOnly: false },
   ]);
 
-  const result = await page.evaluate(() =>
-    window.__siteTools
+  const result = await page.evaluate(async () => {
+    const search = (await window.__siteTools
       .get("search_issues")!
-      .execute({ query: "login", status: "resolved" }),
-  );
-  expect(result).toMatchObject({ tool: "search_issues", count: 2 });
+      .execute({ query: "login", status: "resolved", limit: 20 })) as {
+      issues: { id: number }[];
+    };
+    const detail = await window.__siteTools
+      .get("get_issue")!
+      .execute({ issueId: search.issues[0]!.id });
+    return { search, detail };
+  });
+  expect(result.search).toMatchObject({
+    tool: "search_issues",
+    total: 2,
+    count: 2,
+    filters: { query: "login", status: "resolved", limit: 20 },
+  });
+  expect(result.detail).toMatchObject({
+    tool: "get_issue",
+    issue: { id: 42, title: "Login redirects twice", revision: 1 },
+  });
   await expect(page.getByLabel("Site tool activity")).toContainText(
     "Found 2 matching issues.",
   );

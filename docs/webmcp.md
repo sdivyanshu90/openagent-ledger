@@ -7,11 +7,11 @@ OpenAgent Ledger follows OpenAI's current WebMCP guidance: tools are registered 
 - `search_issues` and `get_issue` are marked with `annotations.readOnlyHint: true` and never mutate state.
 - `close_issue` and `delete_issue` require a reason and stable idempotency key. Invocation creates a proposal; it does not execute the action.
 
-`src/client/webmcp.ts` is the browser-specific boundary. It registers the four capabilities, sends invocation to the same validated server runtime used by the UI, and publishes activity back into the page. Unsupported browsers retain the complete workbench experience without claiming native discovery.
+`src/domain/tool-registry.ts` is canonical. `src/client/webmcp.ts` registers the exact descriptors returned to Tool Explorer and used by the runtime. When contract mode changes, React aborts the old registration set and immediately registers the new canonical descriptors. Browser tests inspect the captured native descriptor after this switch. Unsupported browsers show **Simulation mode · native unavailable** while navigation, scenarios, ledger, and structured reads remain usable.
 
 ## Human-control boundary
 
-The server validates every input, records a hash-linked ledger entry, and returns a sanitized agent result. Approval tokens stay in the human UI path. Execution requires an explicit in-page approval, a matching resource revision, and an unused idempotency key. The server then verifies the resulting state; reversible closes can be undone. Normal application authorization remains required in a real deployment—browser mediation is not an authorization substitute.
+The server validates every input, records a hash-linked proposal, and returns a sanitized agent result. Raw approval secrets never leave server memory. Execution requires an explicit in-page decision from the same HttpOnly human session, an unexpired single-use grant, a matching resource revision, and—when irreversible—the typed issue ID. Idempotency keys deduplicate proposals. The server verifies resulting state; reversible closes can be undone. Normal application authorization remains required in a real deployment—browser mediation and the demo session cookie are not authentication substitutes.
 
 The internal tool model also carries risk, scopes, reversibility, and confirmation metadata that are not asserted to be WebMCP standards. Keeping them behind the adapter lets the draft evolve without coupling domain logic to a browser API.
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { seedDatabase, tools } from "./fixtures";
+import { seedDatabase } from "./fixtures";
 import type { LedgerEntry } from "./schemas";
+import { getToolContract } from "./tool-registry";
 import {
   canTransition,
   InvalidTransitionError,
@@ -9,7 +10,7 @@ import {
 
 function proposed(): LedgerEntry {
   const issue = seedDatabase().issues[0]!;
-  const tool = tools("ambiguous").find(({ name }) => name === "close_issue")!;
+  const tool = getToolContract("ambiguous", "close_issue")!;
   return {
     id: "00000000-0000-4000-8000-000000000001",
     runId: "00000000-0000-4000-8000-000000000002",

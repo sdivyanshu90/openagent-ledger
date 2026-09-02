@@ -61,6 +61,8 @@ export class JsonStore implements Store {
 }
 
 export class MemoryStore implements Store {
+  private queue: Promise<void> = Promise.resolve();
+
   constructor(private database: Database = seedDatabase()) {}
   read(): Promise<Database> {
     return Promise.resolve(structuredClone(this.database));
@@ -68,10 +70,18 @@ export class MemoryStore implements Store {
   async transaction<T>(
     operation: (database: Database) => T | Promise<T>,
   ): Promise<T> {
-    const draft = structuredClone(this.database);
-    const result = await operation(draft);
-    this.database = databaseSchema.parse(draft);
-    return result;
+    let release!: () => void;
+    const previous = this.queue;
+    this.queue = new Promise<void>((resolve) => (release = resolve));
+    await previous;
+    try {
+      const draft = structuredClone(this.database);
+      const result = await operation(draft);
+      this.database = databaseSchema.parse(draft);
+      return result;
+    } finally {
+      release();
+    }
   }
   reset(): Promise<void> {
     this.database = seedDatabase();

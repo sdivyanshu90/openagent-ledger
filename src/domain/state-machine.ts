@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { transitionEvidence } from "./ledger-integrity.js";
 import type { LedgerEntry, LedgerState } from "./schemas.js";
 
 const transitions: Readonly<Record<LedgerState, readonly LedgerState[]>> = {
@@ -10,8 +11,9 @@ const transitions: Readonly<Record<LedgerState, readonly LedgerState[]>> = {
   EXECUTING: ["EXECUTED", "FAILED"],
   EXECUTED: ["VERIFIED", "FAILED"],
   FAILED: [],
-  VERIFIED: ["ROLLED_BACK"],
+  VERIFIED: ["ROLLED_BACK", "ROLLBACK_FAILED"],
   ROLLED_BACK: [],
+  ROLLBACK_FAILED: [],
 };
 
 export class InvalidTransitionError extends Error {
@@ -41,6 +43,12 @@ export function transition(
     actor,
     detail,
     previousHash,
+    evidenceHash: (() => {
+      const evidence = transitionEvidence(entry, state);
+      return evidence === undefined
+        ? undefined
+        : createHash("sha256").update(JSON.stringify(evidence)).digest("hex");
+    })(),
   };
   const integrityHash = createHash("sha256")
     .update(JSON.stringify(event))

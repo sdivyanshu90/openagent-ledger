@@ -39,7 +39,7 @@ describe("HTTP API", () => {
     expect(response.json()).toMatchObject({ code: "VALIDATION_ERROR" });
   });
 
-  it("exposes actual application capabilities through the guarded API", async () => {
+  it("exposes guarded proposals without returning approval credentials", async () => {
     const app = buildApp(new MemoryStore());
     apps.push(app);
     const response = await app.inject({
@@ -57,11 +57,47 @@ describe("HTTP API", () => {
     expect(response.statusCode).toBe(201);
     const body = z
       .object({
-        action: z.object({ state: z.string() }),
-        approvalToken: z.string(),
+        action: z.object({ id: z.string().uuid(), state: z.string() }),
       })
       .parse(response.json());
     expect(body.action.state).toBe("AWAITING_CONFIRMATION");
-    expect(body.approvalToken.length).toBeGreaterThan(20);
+    expect(JSON.stringify(response.json())).not.toContain("approvalToken");
+
+    const setCookie = response.headers["set-cookie"];
+    const cookie = (Array.isArray(setCookie) ? setCookie[0] : setCookie)?.split(
+      ";",
+    )[0];
+    expect(cookie).toContain("openagent_human_session=");
+    const unscopedApproval = await app.inject({
+      method: "POST",
+      url: `/api/actions/${body.action.id}/approve`,
+      payload: {},
+    });
+    expect(unscopedApproval.statusCode).toBe(403);
+    expect(unscopedApproval.json()).toMatchObject({
+      code: "INVALID_APPROVAL",
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/actions/${body.action.id}/approve`,
+      headers: { cookie: cookie! },
+      payload: {},
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json()).toMatchObject({
+      action: { state: "VERIFIED" },
+      issue: { status: "closed" },
+    });
+  });
+
+  it("does not expose an unapproved execution endpoint", async () => {
+    const app = buildApp(new MemoryStore());
+    apps.push(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/actions/00000000-0000-4000-8000-000000000001/execute",
+      payload: {},
+    });
+    expect(response.statusCode).toBe(404);
   });
 });
